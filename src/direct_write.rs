@@ -1,7 +1,9 @@
+// Modified by ibis inc. for ibisOffice (2026-10-01): implemented `PlatformTextSystem::font_data`.
 use std::{
     borrow::Cow,
     ffi::{c_uint, c_void},
     mem::ManuallyDrop,
+    sync::Arc,
 };
 
 use anyhow::{Context, Result};
@@ -77,6 +79,9 @@ struct DirectWriteState {
     font_to_font_id: HashMap<Font, FontId>,
     font_info_cache: HashMap<usize, FontId>,
     layout_line_scratch: Vec<u16>,
+    /// The data of font files read for `font_data`, by their loader and
+    /// reference key (a file is read once: a collection may be tens of MB).
+    font_files: HashMap<(usize, Vec<u8>), Arc<Vec<u8>>>,
 }
 
 impl GPUState {
@@ -214,6 +219,7 @@ impl DirectWriteTextSystem {
                 font_to_font_id: HashMap::default(),
                 font_info_cache: HashMap::default(),
                 layout_line_scratch: Vec::new(),
+                font_files: HashMap::default(),
             }),
         })
     }
@@ -245,6 +251,10 @@ impl PlatformTextSystem for DirectWriteTextSystem {
 
     fn font_metrics(&self, font_id: FontId) -> FontMetrics {
         self.state.read().font_metrics(font_id)
+    }
+
+    fn font_data(&self, font_id: FontId) -> Option<(Arc<Vec<u8>>, u32)> {
+        self.state.write().font_data(font_id)
     }
 
     fn typographic_bounds(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Bounds<f32>> {
@@ -660,6 +670,44 @@ impl DirectWriteState {
                     },
                 },
             }
+        }
+    }
+
+    /// The data of the file the font comes from, read through its loader (so
+    /// an installed font and one added from memory alike), and the font's
+    /// index in it. A font made bold or italic by DirectWrite gives the file
+    /// of the face it is made from.
+    fn font_data(&mut self, font_id: FontId) -> Option<(Arc<Vec<u8>>, u32)> {
+        let face = &self.fonts.get(font_id.0)?.font_face;
+        unsafe {
+            let index = face.GetIndex();
+            let mut count = 1;
+            let mut files = [None];
+            face.GetFiles(&mut count, Some(files.as_mut_ptr())).log_err()?;
+            let file = files[0].take()?;
+            let mut key = std::ptr::null_mut();
+            let mut key_size = 0;
+            file.GetReferenceKey(&mut key, &mut key_size).log_err()?;
+            let loader = file.GetLoader().log_err()?;
+            let cache_key = (
+                loader.as_raw().addr(),
+                std::slice::from_raw_parts(key as *const u8, key_size as usize).to_vec(),
+            );
+            if let Some(data) = self.font_files.get(&cache_key) {
+                return Some((data.clone(), index));
+            }
+            let stream = loader.CreateStreamFromKey(key, key_size).log_err()?;
+            let size = stream.GetFileSize().log_err()?;
+            let mut fragment = std::ptr::null_mut();
+            let mut context = std::ptr::null_mut();
+            stream
+                .ReadFileFragment(&mut fragment, 0, size, &mut context)
+                .log_err()?;
+            let data = std::slice::from_raw_parts(fragment as *const u8, size as usize).to_vec();
+            stream.ReleaseFileFragment(context);
+            let data = Arc::new(data);
+            self.font_files.insert(cache_key, data.clone());
+            Some((data, index))
         }
     }
 
