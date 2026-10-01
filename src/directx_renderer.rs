@@ -1,3 +1,4 @@
+// Modified by ibis inc. for ibisOffice (2026-10-01): added `DirectXHeadlessRenderer` (drawing without a window).
 use std::{
     slice,
     sync::{Arc, OnceLock},
@@ -190,6 +191,35 @@ impl DirectXRenderer {
             globals,
             pipelines,
             direct_composition,
+            font_info: Self::get_font_info(),
+            width: 1,
+            height: 1,
+            skip_draws: false,
+        })
+    }
+
+    /// A renderer drawing without a window, for [`DirectXHeadlessRenderer`]:
+    /// into a composition swap chain (which needs no window) that is never
+    /// presented or attached to DirectComposition.
+    #[cfg(feature = "test-support")]
+    fn new_headless(directx_devices: &DirectXDevices) -> Result<Self> {
+        let devices =
+            DirectXRendererDevices::new(directx_devices, false).context("Creating DirectX devices")?;
+        let atlas = Arc::new(DirectXAtlas::new(&devices.device, &devices.device_context));
+        let resources = DirectXResources::new(&devices, 1, 1, HWND::default(), false)
+            .context("Creating DirectX resources")?;
+        let globals = DirectXGlobalElements::new(&devices.device)
+            .context("Creating DirectX global elements")?;
+        let pipelines = DirectXRenderPipelines::new(&devices.device)
+            .context("Creating DirectX render pipelines")?;
+        Ok(DirectXRenderer {
+            hwnd: HWND::default(),
+            atlas,
+            devices: Some(devices),
+            resources: Some(resources),
+            globals,
+            pipelines,
+            direct_composition: None,
             font_info: Self::get_font_info(),
             width: 1,
             height: 1,
@@ -1273,6 +1303,50 @@ struct PathRasterizationSprite {
 #[repr(C)]
 struct PathSprite {
     bounds: Bounds<ScaledPixels>,
+}
+
+/// Draws scenes without a window or a screen, into images: the Windows
+/// counterpart of GPUI's headless Metal renderer, with the same drawing as a
+/// window's renderer.
+///
+/// Added in ibisOffice's fork of gpui-pre-windows 0.3.6.
+#[cfg(feature = "test-support")]
+pub struct DirectXHeadlessRenderer {
+    renderer: DirectXRenderer,
+}
+
+#[cfg(feature = "test-support")]
+impl DirectXHeadlessRenderer {
+    /// A renderer on the system's graphics device (WARP when there is none).
+    pub fn new() -> Result<Self> {
+        let devices = DirectXDevices::new().context("Creating DirectX devices")?;
+        Ok(Self {
+            renderer: DirectXRenderer::new_headless(&devices)?,
+        })
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl PlatformHeadlessRenderer for DirectXHeadlessRenderer {
+    fn render_scene_to_image(
+        &mut self,
+        scene: &Scene,
+        size: Size<DevicePixels>,
+    ) -> Result<image::RgbaImage> {
+        self.renderer.resize(size)?;
+        self.renderer
+            .render_to_image(scene, WindowBackgroundAppearance::Opaque)
+    }
+
+    fn render_scene(&mut self, scene: &Scene, size: Size<DevicePixels>) -> Result<()> {
+        self.renderer.resize(size)?;
+        self.renderer
+            .render(scene, WindowBackgroundAppearance::Opaque)
+    }
+
+    fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
+        self.renderer.sprite_atlas()
+    }
 }
 
 impl Drop for DirectXRenderer {

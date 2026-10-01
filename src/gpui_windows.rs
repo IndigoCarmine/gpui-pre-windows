@@ -1,3 +1,4 @@
+// Modified by ibis inc. for ibisOffice (2026-10-01): exports `DirectXHeadlessRenderer`.
 #![cfg(target_os = "windows")]
 
 mod clipboard;
@@ -39,5 +40,7 @@ pub(crate) use window::*;
 pub(crate) use wrapper::*;
 
 pub use platform::WindowsPlatform;
+#[cfg(feature = "test-support")]
+pub use directx_renderer::DirectXHeadlessRenderer;
 
 pub(crate) use windows::Win32::Foundation::HWND;
