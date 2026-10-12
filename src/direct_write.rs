@@ -1,4 +1,5 @@
 // Modified by ibis inc. for ibisOffice (2026-10-01): implemented `PlatformTextSystem::font_data`.
+// Modified by ibis inc. for ibisOffice (2026-10-12): `layout_line` keeps the lines it laid out, by text, size and font runs.
 use std::{
     borrow::Cow,
     ffi::{c_uint, c_void},
@@ -79,10 +80,35 @@ struct DirectWriteState {
     font_to_font_id: HashMap<Font, FontId>,
     font_info_cache: HashMap<usize, FontId>,
     layout_line_scratch: Vec<u16>,
+    /// The lines laid out, by text, font size and font runs. A sheet printed
+    /// to PDF lays out 430 000 cell texts of which 40 000 differ: the same
+    /// text in the same font comes out the same, so it is laid out once.
+    layout_cache: HashMap<LayoutKey, CachedLayout>,
     /// The data of font files read for `font_data`, by their loader and
     /// reference key (a file is read once: a collection may be tens of MB).
     font_files: HashMap<(usize, Vec<u8>), Arc<Vec<u8>>>,
 }
+
+/// What a laid out line depends on: its text, the font size (as bits), and
+/// each run's font and length.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct LayoutKey {
+    text: String,
+    font_size: u32,
+    runs: Vec<(usize, usize)>,
+}
+
+/// A laid out line (`LineLayout` is not `Clone`).
+struct CachedLayout {
+    width: Pixels,
+    ascent: Pixels,
+    descent: Pixels,
+    runs: Vec<ShapedRun>,
+    len: usize,
+}
+
+/// The lines kept at most; the cache starts again when it is full.
+const LAYOUT_CACHE_LIMIT: usize = 200_000;
 
 impl GPUState {
     fn new(directx_devices: &DirectXDevices) -> Result<Self> {
@@ -219,6 +245,7 @@ impl DirectWriteTextSystem {
                 font_to_font_id: HashMap::default(),
                 font_info_cache: HashMap::default(),
                 layout_line_scratch: Vec::new(),
+                layout_cache: HashMap::default(),
                 font_files: HashMap::default(),
             }),
         })
@@ -534,6 +561,21 @@ impl DirectWriteState {
                 ..Default::default()
             });
         }
+        let key = LayoutKey {
+            text: text.to_string(),
+            font_size: font_size.as_f32().to_bits(),
+            runs: font_runs.iter().map(|run| (run.font_id.0, run.len)).collect(),
+        };
+        if let Some(cached) = self.layout_cache.get(&key) {
+            return Ok(LineLayout {
+                font_size,
+                width: cached.width,
+                ascent: cached.ascent,
+                descent: cached.descent,
+                runs: cached.runs.clone(),
+                len: cached.len,
+            });
+        }
         unsafe {
             self.layout_line_scratch.clear();
             self.layout_line_scratch.extend(text.encode_utf16());
@@ -633,6 +675,19 @@ impl DirectWriteState {
             )?;
             let width = px(renderer_context.width);
 
+            if self.layout_cache.len() >= LAYOUT_CACHE_LIMIT {
+                self.layout_cache.clear();
+            }
+            self.layout_cache.insert(
+                key,
+                CachedLayout {
+                    width,
+                    ascent,
+                    descent,
+                    runs: runs.clone(),
+                    len: text.len(),
+                },
+            );
             Ok(LineLayout {
                 font_size,
                 width,
