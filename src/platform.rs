@@ -1389,6 +1389,14 @@ fn file_open_dialog(
     unsafe {
         folder_dialog.SetOptions(dialog_options)?;
 
+        // Only the files of the given extensions are listed (modified by ibis inc.).
+        let types: Vec<String> = options.extensions.iter().filter(|e| !e.is_empty()).map(|e| format!("*.{e}")).collect();
+        if !types.is_empty() && !options.directories {
+            let name = HSTRING::from(options.extensions.iter().map(|e| format!("*.{e}")).collect::<Vec<_>>().join(", "));
+            let spec = HSTRING::from(types.join(";"));
+            folder_dialog.SetFileTypes(&[Common::COMDLG_FILTERSPEC { pszName: windows::core::PCWSTR(name.as_ptr()), pszSpec: windows::core::PCWSTR(spec.as_ptr()) }])?;
+        }
+
         if let Some(prompt) = options.prompt {
             let prompt: &str = &prompt;
             folder_dialog.SetOkButtonLabel(&HSTRING::from(prompt))?;
