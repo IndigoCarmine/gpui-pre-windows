@@ -1,3 +1,4 @@
+// Modified by ibis inc. for ibisOffice (2026-10-17): `path_sprite_fragment` averages the samples of the paths' MSAA texture itself.
 #include "alpha_correction.hlsl"
 
 cbuffer GlobalParams: register(b0) {
@@ -1052,8 +1053,20 @@ PathSpriteVertexOutput path_sprite_vertex(uint vertex_id: SV_VertexID, uint spri
     return output;
 }
 
+// The paths' MSAA texture, read here, sample by sample, instead of resolved
+// as a whole beforehand (directx_renderer.rs: `draw_paths_to_intermediate`).
+Texture2DMS<float4> t_path_samples: register(t0);
+
 float4 path_sprite_fragment(PathSpriteVertexOutput input): SV_Target {
-    return t_sprite.Sample(s_sprite, input.texture_coords);
+    // The average of the pixel's samples, as resolving the texture gives.
+    uint width, height, samples;
+    t_path_samples.GetDimensions(width, height, samples);
+    int2 pixel = int2(input.position.xy);
+    float4 sum = float4(0.0, 0.0, 0.0, 0.0);
+    for (uint i = 0; i < samples; i++) {
+        sum += t_path_samples.Load(pixel, i);
+    }
+    return sum / float(samples);
 }
 
 /*

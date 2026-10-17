@@ -1,4 +1,5 @@
 // Modified by ibis inc. for ibisOffice (2026-10-01): added `DirectXHeadlessRenderer` (drawing without a window).
+// Modified by ibis inc. for ibisOffice (2026-10-17): a path batch clears only its own area and is not resolved as a whole (its samples are averaged where it is copied).
 use std::{
     slice,
     sync::{Arc, OnceLock},
@@ -66,6 +67,9 @@ pub(crate) struct DirectXRendererDevices {
     pub(crate) device_context: ID3D11DeviceContext,
     dxgi_device: Option<IDXGIDevice>,
     annotation: Option<ID3DUserDefinedAnnotation>,
+    /// The context, when its driver can clear part of a view
+    /// (`ClearView`): a path batch clears only its own area.
+    clear_view: Option<ID3D11DeviceContext1>,
 }
 
 struct DirectXResources {
@@ -74,11 +78,11 @@ struct DirectXResources {
     render_target: Option<ID3D11Texture2D>,
     render_target_view: Option<ID3D11RenderTargetView>,
 
-    // Path intermediate textures (with MSAA)
-    path_intermediate_texture: ID3D11Texture2D,
-    path_intermediate_srv: Option<ID3D11ShaderResourceView>,
+    // Path intermediate texture (with MSAA): rendered into, then read (its
+    // samples averaged) where the paths are copied to the drawable
     path_intermediate_msaa_texture: ID3D11Texture2D,
     path_intermediate_msaa_view: Option<ID3D11RenderTargetView>,
+    path_intermediate_srv: Option<ID3D11ShaderResourceView>,
 
     // Cached viewport
     viewport: D3D11_VIEWPORT,
@@ -139,6 +143,18 @@ impl DirectXRendererDevices {
             Some(device.cast().context("Creating DXGI device")?)
         };
         let annotation = device_context.cast().ok();
+        let clear_view = unsafe {
+            let mut options = D3D11_FEATURE_DATA_D3D11_OPTIONS::default();
+            let supported = device
+                .CheckFeatureSupport(
+                    D3D11_FEATURE_D3D11_OPTIONS,
+                    &mut options as *mut _ as *mut _,
+                    std::mem::size_of::<D3D11_FEATURE_DATA_D3D11_OPTIONS>() as u32,
+                )
+                .is_ok()
+                && options.ClearView.as_bool();
+            if supported { device_context.cast().ok() } else { None }
+        };
 
         Ok(Self {
             adapter: adapter.clone(),
@@ -147,6 +163,7 @@ impl DirectXRendererDevices {
             device_context: device_context.clone(),
             dxgi_device,
             annotation,
+            clear_view,
         })
     }
 }
@@ -649,12 +666,19 @@ impl DirectXRenderer {
 
         let devices = self.devices.as_ref().context("devices missing")?;
         let resources = self.resources.as_ref().context("resources missing")?;
-        // Clear intermediate MSAA texture
+        // Clear intermediate MSAA texture: only under the batch's paths, where
+        // `draw_paths_from_intermediate` reads it back, when the driver can.
+        // A batch of a few small paths (a page has dozens of batches) would
+        // otherwise clear the whole window's texture each time.
         unsafe {
-            devices.device_context.ClearRenderTargetView(
-                resources.path_intermediate_msaa_view.as_ref().unwrap(),
-                &[0.0; 4],
-            );
+            let view = resources.path_intermediate_msaa_view.as_ref().unwrap();
+            match &devices.clear_view {
+                Some(context) => {
+                    let area = paths_area(paths, &resources.viewport);
+                    context.ClearView(view, &[0.0; 4], Some(slice::from_ref(&area)));
+                }
+                None => devices.device_context.ClearRenderTargetView(view, &[0.0; 4]),
+            }
             // Set intermediate MSAA texture as render target
             devices.device_context.OMSetRenderTargets(
                 Some(slice::from_ref(&resources.path_intermediate_msaa_view)),
@@ -687,15 +711,10 @@ impl DirectXRenderer {
             1,
         )?;
 
-        // Resolve MSAA to non-MSAA intermediate texture
+        // The samples are averaged where the paths are copied to the drawable
+        // (`path_sprite_fragment` reads the MSAA texture): resolving the whole
+        // texture here took most of the frame when a page had many batches.
         unsafe {
-            devices.device_context.ResolveSubresource(
-                &resources.path_intermediate_texture,
-                0,
-                &resources.path_intermediate_msaa_texture,
-                0,
-                RENDER_TARGET_FORMAT,
-            );
             // Restore main render target
             devices
                 .device_context
@@ -916,7 +935,6 @@ impl DirectXResources {
         let (
             render_target,
             render_target_view,
-            path_intermediate_texture,
             path_intermediate_srv,
             path_intermediate_msaa_texture,
             path_intermediate_msaa_view,
@@ -928,7 +946,6 @@ impl DirectXResources {
             swap_chain,
             render_target: Some(render_target),
             render_target_view,
-            path_intermediate_texture,
             path_intermediate_msaa_texture,
             path_intermediate_msaa_view,
             path_intermediate_srv,
@@ -946,7 +963,6 @@ impl DirectXResources {
         let (
             render_target,
             render_target_view,
-            path_intermediate_texture,
             path_intermediate_srv,
             path_intermediate_msaa_texture,
             path_intermediate_msaa_view,
@@ -954,7 +970,6 @@ impl DirectXResources {
         ) = create_resources(devices, &self.swap_chain, width, height)?;
         self.render_target = Some(render_target);
         self.render_target_view = render_target_view;
-        self.path_intermediate_texture = path_intermediate_texture;
         self.path_intermediate_msaa_texture = path_intermediate_msaa_texture;
         self.path_intermediate_msaa_view = path_intermediate_msaa_view;
         self.path_intermediate_srv = path_intermediate_srv;
@@ -1429,7 +1444,6 @@ fn create_resources(
 ) -> Result<(
     ID3D11Texture2D,
     Option<ID3D11RenderTargetView>,
-    ID3D11Texture2D,
     Option<ID3D11ShaderResourceView>,
     ID3D11Texture2D,
     Option<ID3D11RenderTargetView>,
@@ -1437,9 +1451,7 @@ fn create_resources(
 )> {
     let (render_target, render_target_view) =
         create_render_target_and_its_view(swap_chain, &devices.device)?;
-    let (path_intermediate_texture, path_intermediate_srv) =
-        create_path_intermediate_texture(&devices.device, width, height)?;
-    let (path_intermediate_msaa_texture, path_intermediate_msaa_view) =
+    let (path_intermediate_msaa_texture, path_intermediate_msaa_view, path_intermediate_srv) =
         create_path_intermediate_msaa_texture_and_view(&devices.device, width, height)?;
     let viewport = D3D11_VIEWPORT {
         TopLeftX: 0.0,
@@ -1452,7 +1464,6 @@ fn create_resources(
     Ok((
         render_target,
         render_target_view,
-        path_intermediate_texture,
         path_intermediate_srv,
         path_intermediate_msaa_texture,
         path_intermediate_msaa_view,
@@ -1472,44 +1483,11 @@ fn create_render_target_and_its_view(
 }
 
 #[inline]
-fn create_path_intermediate_texture(
-    device: &ID3D11Device,
-    width: u32,
-    height: u32,
-) -> Result<(ID3D11Texture2D, Option<ID3D11ShaderResourceView>)> {
-    let texture = unsafe {
-        let mut output = None;
-        let desc = D3D11_TEXTURE2D_DESC {
-            Width: width,
-            Height: height,
-            MipLevels: 1,
-            ArraySize: 1,
-            Format: RENDER_TARGET_FORMAT,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
-            CPUAccessFlags: 0,
-            MiscFlags: 0,
-        };
-        device.CreateTexture2D(&desc, None, Some(&mut output))?;
-        output.unwrap()
-    };
-
-    let mut shader_resource_view = None;
-    unsafe { device.CreateShaderResourceView(&texture, None, Some(&mut shader_resource_view))? };
-
-    Ok((texture, Some(shader_resource_view.unwrap())))
-}
-
-#[inline]
 fn create_path_intermediate_msaa_texture_and_view(
     device: &ID3D11Device,
     width: u32,
     height: u32,
-) -> Result<(ID3D11Texture2D, Option<ID3D11RenderTargetView>)> {
+) -> Result<(ID3D11Texture2D, Option<ID3D11RenderTargetView>, Option<ID3D11ShaderResourceView>)> {
     let msaa_texture = unsafe {
         let mut output = None;
         let desc = D3D11_TEXTURE2D_DESC {
@@ -1523,7 +1501,7 @@ fn create_path_intermediate_msaa_texture_and_view(
                 Quality: D3D11_STANDARD_MULTISAMPLE_PATTERN.0 as u32,
             },
             Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+            BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
             CPUAccessFlags: 0,
             MiscFlags: 0,
         };
@@ -1532,7 +1510,25 @@ fn create_path_intermediate_msaa_texture_and_view(
     };
     let mut msaa_view = None;
     unsafe { device.CreateRenderTargetView(&msaa_texture, None, Some(&mut msaa_view))? };
-    Ok((msaa_texture, Some(msaa_view.unwrap())))
+    let mut shader_resource_view = None;
+    unsafe { device.CreateShaderResourceView(&msaa_texture, None, Some(&mut shader_resource_view))? };
+    Ok((msaa_texture, Some(msaa_view.unwrap()), Some(shader_resource_view.unwrap())))
+}
+
+/// The whole device pixels under `paths`, within `viewport`: where a path
+/// batch is rasterized and read back.
+fn paths_area(paths: &[Path<ScaledPixels>], viewport: &D3D11_VIEWPORT) -> windows::Win32::Foundation::RECT {
+    let mut bounds = paths[0].clipped_bounds();
+    for path in &paths[1..] {
+        bounds = bounds.union(&path.clipped_bounds());
+    }
+    let clamp = |v: f32, max: f32| v.clamp(0.0, max) as i32;
+    windows::Win32::Foundation::RECT {
+        left: clamp(bounds.origin.x.0.floor(), viewport.Width),
+        top: clamp(bounds.origin.y.0.floor(), viewport.Height),
+        right: clamp((bounds.origin.x.0 + bounds.size.width.0).ceil(), viewport.Width),
+        bottom: clamp((bounds.origin.y.0 + bounds.size.height.0).ceil(), viewport.Height),
+    }
 }
 
 #[inline]
