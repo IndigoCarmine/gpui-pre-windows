@@ -31,7 +31,10 @@ use gpui::*;
 
 #[derive(Debug)]
 struct FontInfo {
+    /// The family the face is in, as the collection names it ("Arial" for
+    /// "Arial Narrow"), and the face's stretch: what text layouts ask for.
     font_family_h: HSTRING,
+    font_stretch: DWRITE_FONT_STRETCH,
     font_face: IDWriteFontFace3,
     features: IDWriteTypography,
     fallbacks: Option<IDWriteFontFallback>,
@@ -520,6 +523,30 @@ impl DirectWriteState {
                 )
                 .log_err()?
         };
+        // Not a family of the collection: its faces by their GDI family name
+        // ("Arial Narrow"), the nearest in weight and style first.
+        let font = if unsafe { font.GetFontCount() } == 0 {
+            let property = DWRITE_FONT_PROPERTY {
+                propertyId: DWRITE_FONT_PROPERTY_ID_WIN32_FAMILY_NAME,
+                propertyValue: PCWSTR(font_family_h.as_ptr()),
+                localeName: w!(""),
+            };
+            let by_gdi_name = unsafe { fontset.GetMatchingFonts2(&[property]).log_err()? };
+            let wanted = (font_weight_to_dwrite(weight).0, font_style_to_dwrite(style));
+            let best = (0..unsafe { by_gdi_name.GetFontCount() }).min_by_key(|&index| {
+                let Some(face) = (unsafe { by_gdi_name.GetFontFaceReference(index).and_then(|r| r.CreateFontFace()).ok() }) else {
+                    return i32::MAX;
+                };
+                let (face_weight, face_style) = unsafe { (face.GetWeight().0, face.GetStyle()) };
+                (face_weight - wanted.0).abs() + if face_style == wanted.1 { 0 } else { 1000 }
+            })?;
+            let reference = unsafe { by_gdi_name.GetFontFaceReference(best).log_err()? };
+            let builder = unsafe { factory.CreateFontSetBuilder().log_err()? };
+            unsafe { builder.AddFontFaceReference2(&reference).log_err()? };
+            unsafe { builder.CreateFontSet().log_err()? }
+        } else {
+            font
+        };
         let total_number = unsafe { font.GetFontCount() };
         for index in 0..total_number {
             let res = maybe!({
@@ -532,8 +559,19 @@ impl DirectWriteState {
                         .log_err()
                         .flatten()
                 });
+                // A face found by its GDI name ("Arial Narrow") is in a family
+                // of another name in the collection ("Arial", condensed).
+                let collection_family = unsafe {
+                    collection
+                        .GetFontFromFontFace(&font_face)
+                        .and_then(|font| font.GetFontFamily())
+                        .and_then(|family| family.GetFamilyNames())
+                        .ok()
+                        .and_then(|names| get_name(names, &HSTRING::from("en-us")).ok())
+                };
                 let font_info = FontInfo {
-                    font_family_h: font_family_h.clone(),
+                    font_family_h: collection_family.map_or_else(|| font_family_h.clone(), |name| HSTRING::from(name.as_str())),
+                    font_stretch: unsafe { font_face.GetStretch() },
                     font_face,
                     features: direct_write_features,
                     fallbacks,
@@ -594,7 +632,7 @@ impl DirectWriteState {
                         collection,
                         font_info.font_face.GetWeight(),
                         font_info.font_face.GetStyle(),
-                        DWRITE_FONT_STRETCH_NORMAL,
+                        font_info.font_stretch,
                         font_size.as_f32(),
                         &components.locale,
                     )?
@@ -654,6 +692,7 @@ impl DirectWriteState {
                 text_layout.SetFontSize(font_size, text_range)?;
                 text_layout.SetFontStyle(font_info.font_face.GetStyle(), text_range)?;
                 text_layout.SetFontWeight(font_info.font_face.GetWeight(), text_range)?;
+                text_layout.SetFontStretch(font_info.font_stretch, text_range)?;
                 text_layout.SetTypography(&font_info.features, text_range)?;
 
                 break_ligatures = !break_ligatures;
@@ -1864,6 +1903,28 @@ fn get_font_names_from_collection(
                 continue;
             };
             result.push(family_name);
+        }
+        // The GDI (Win32) family names too: DirectWrite puts "Arial Narrow" and
+        // "Arial Black" in its "Arial" family, but documents name them, and
+        // `IDWriteFontSet::GetMatchingFonts` finds fonts by these names.
+        if let Some(names) = collection
+            .GetFontSet()
+            .and_then(|set| set.GetPropertyValues2(DWRITE_FONT_PROPERTY_ID_WIN32_FAMILY_NAME, locale))
+            .log_err()
+        {
+            for index in 0..names.GetCount() {
+                let Some(length) = names.GetStringLength(index).log_err() else {
+                    continue;
+                };
+                let mut buffer = vec![0u16; length as usize + 1];
+                if names.GetString(index, &mut buffer).log_err().is_none() {
+                    continue;
+                }
+                let name = String::from_utf16_lossy(&buffer[..length as usize]);
+                if !name.is_empty() && !result.contains(&name) {
+                    result.push(name);
+                }
+            }
         }
 
         result
