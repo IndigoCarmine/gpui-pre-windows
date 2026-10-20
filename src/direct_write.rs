@@ -1899,10 +1899,27 @@ fn get_font_names_from_collection(
             let Some(localized_family_name) = font_family.GetFamilyNames().log_err() else {
                 continue;
             };
-            let Some(family_name) = get_name(localized_family_name, locale).log_err() else {
+            let Some(family_name) = get_name(localized_family_name.clone(), locale).log_err() else {
                 continue;
             };
             result.push(family_name);
+            // Its names in the other languages too: a document names the
+            // typeface as the system it was written on does ("MS Mincho" on a
+            // Japanese system, where it is "ＭＳ 明朝"), and `GetMatchingFonts`
+            // finds it by any of them.
+            for name_index in 0..localized_family_name.GetCount() {
+                let Some(length) = localized_family_name.GetStringLength(name_index).log_err() else {
+                    continue;
+                };
+                let mut buffer = vec![0u16; length as usize + 1];
+                if localized_family_name.GetString(name_index, &mut buffer).log_err().is_none() {
+                    continue;
+                }
+                let name = String::from_utf16_lossy(&buffer[..length as usize]);
+                if !name.is_empty() && !result.contains(&name) {
+                    result.push(name);
+                }
+            }
         }
         // The GDI (Win32) family names too: DirectWrite puts "Arial Narrow" and
         // "Arial Black" in its "Arial" family, but documents name them, and
