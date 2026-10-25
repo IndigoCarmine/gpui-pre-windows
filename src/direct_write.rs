@@ -1,5 +1,6 @@
 // Modified by ibis inc. for ibisOffice (2026-10-01): implemented `PlatformTextSystem::font_data`.
 // Modified by ibis inc. for ibisOffice (2026-10-12): `layout_line` keeps the lines it laid out, by text, size and font runs.
+// Modified by ibis inc. for ibisOffice (2026-10-25): a face DirectWrite emboldens (a family without a bold face) keeps the regular face's advances.
 use std::{
     borrow::Cow,
     ffi::{c_uint, c_void},
@@ -1681,6 +1682,7 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
             )?
         };
 
+        let widening = simulated_bold_widening(font_face, glyph_ids, glyphrun.fontEmSize);
         let cluster_analyzer = ClusterAnalyzer::new(cluster_map, glyph_count);
         let mut utf16_idx = desc.textPosition as usize;
         let mut glyph_idx = 0;
@@ -1706,7 +1708,7 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
                     index: context.index_converter.utf8_ix,
                     is_emoji,
                 });
-                context.width += glyph_advances[this_glyph_idx];
+                context.width += glyph_advances[this_glyph_idx] - widening.as_ref().map_or(0.0, |w| w[this_glyph_idx]);
             }
             glyph_idx += cluster_glyph_count;
         }
@@ -1867,6 +1869,31 @@ fn get_font_names_from_collection(
         }
 
         result
+    }
+}
+
+/// How much wider DirectWrite's simulated bold makes each glyph of a run than the face it emboldens (design units
+/// scaled to the run's size). PowerPoint and ibisOffice's macOS text system draw such a bold by thickening the regular
+/// glyphs without moving the next one, so the advance is the regular face's.
+fn simulated_bold_widening(font_face: &IDWriteFontFace3, glyph_ids: &[u16], em_size: f32) -> Option<Vec<f32>> {
+    unsafe {
+        let simulations = font_face.GetSimulations();
+        if simulations.0 & DWRITE_FONT_SIMULATIONS_BOLD.0 == 0 {
+            return None;
+        }
+        let plain = font_face
+            .GetFontFaceReference()
+            .ok()?
+            .CreateFontFaceWithSimulations(DWRITE_FONT_SIMULATIONS(simulations.0 & !DWRITE_FONT_SIMULATIONS_BOLD.0))
+            .ok()?;
+        let mut metrics = std::mem::zeroed();
+        font_face.GetMetrics(&mut metrics);
+        let scale = em_size / metrics.Base.designUnitsPerEm as f32;
+        let mut emboldened = vec![DWRITE_GLYPH_METRICS::default(); glyph_ids.len()];
+        let mut regular = vec![DWRITE_GLYPH_METRICS::default(); glyph_ids.len()];
+        font_face.GetDesignGlyphMetrics(glyph_ids.as_ptr(), glyph_ids.len() as u32, emboldened.as_mut_ptr(), false).ok()?;
+        plain.GetDesignGlyphMetrics(glyph_ids.as_ptr(), glyph_ids.len() as u32, regular.as_mut_ptr(), false).ok()?;
+        Some(emboldened.iter().zip(&regular).map(|(e, r)| ((e.advanceWidth as f32 - r.advanceWidth as f32) * scale).max(0.0)).collect())
     }
 }
 
