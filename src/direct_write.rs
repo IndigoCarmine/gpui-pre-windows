@@ -1,6 +1,6 @@
 // Modified by ibis inc. for ibisOffice (2026-10-01): implemented `PlatformTextSystem::font_data`.
 // Modified by ibis inc. for ibisOffice (2026-10-12): `layout_line` keeps the lines it laid out, by text, size and font runs.
-// Modified by ibis inc. for ibisOffice (2026-10-25): a face DirectWrite emboldens (a family without a bold face) keeps the regular face's advances.
+// Modified by ibis inc. for ibisOffice (2026-10-25): a face DirectWrite emboldens (a family without a bold face) keeps the regular face's advances; `PlatformTextSystem::synthetic_style`.
 use std::{
     borrow::Cow,
     ffi::{c_uint, c_void},
@@ -279,6 +279,10 @@ impl PlatformTextSystem for DirectWriteTextSystem {
 
     fn font_metrics(&self, font_id: FontId) -> FontMetrics {
         self.state.read().font_metrics(font_id)
+    }
+
+    fn synthetic_style(&self, font_id: FontId) -> (bool, bool) {
+        self.state.read().synthetic_style(font_id)
     }
 
     fn font_data(&self, font_id: FontId) -> Option<(Arc<Vec<u8>>, u32)> {
@@ -1356,6 +1360,15 @@ impl DirectWriteState {
                 },
             })
         }
+    }
+
+    /// Whether DirectWrite emboldens and slants the face (a family without a bold or italic face of its own): the glyphs
+    /// the font file holds are the regular ones, so a PDF has to thicken and slant them itself.
+    fn synthetic_style(&self, font_id: FontId) -> (bool, bool) {
+        self.fonts.get(font_id.0).map_or((false, false), |info| {
+            let simulations = unsafe { info.font_face.GetSimulations() }.0;
+            (simulations & DWRITE_FONT_SIMULATIONS_BOLD.0 != 0, simulations & DWRITE_FONT_SIMULATIONS_OBLIQUE.0 != 0)
+        })
     }
 
     fn get_advance(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Size<f32>> {
