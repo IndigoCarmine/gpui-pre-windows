@@ -1,5 +1,6 @@
 // Modified by ibis inc. for ibisOffice (2026-10-01): implemented `PlatformTextSystem::font_data`.
 // Modified by ibis inc. for ibisOffice (2026-10-12): `layout_line` keeps the lines it laid out, by text, size and font runs.
+// Modified by ibis inc. for ibisOffice (2026-10-28): `PlatformTextSystem::font_variations` (the axis values of a variable font's face).
 // Modified by ibis inc. for ibisOffice (2026-10-25): a face DirectWrite emboldens (a family without a bold face) keeps the regular face's advances; `PlatformTextSystem::synthetic_style`.
 use std::{
     borrow::Cow,
@@ -287,6 +288,10 @@ impl PlatformTextSystem for DirectWriteTextSystem {
 
     fn font_data(&self, font_id: FontId) -> Option<(Arc<Vec<u8>>, u32)> {
         self.state.write().font_data(font_id)
+    }
+
+    fn font_variations(&self, font_id: FontId) -> Vec<([u8; 4], f32)> {
+        self.state.read().font_variations(font_id)
     }
 
     fn typographic_bounds(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Bounds<f32>> {
@@ -1369,6 +1374,23 @@ impl DirectWriteState {
             let simulations = unsafe { info.font_face.GetSimulations() }.0;
             (simulations & DWRITE_FONT_SIMULATIONS_BOLD.0 != 0, simulations & DWRITE_FONT_SIMULATIONS_OBLIQUE.0 != 0)
         })
+    }
+
+    /// The axis values (`wght`, `wdth`, ...) of the face when it is an instance of a variable font; empty otherwise.
+    fn font_variations(&self, font_id: FontId) -> Vec<([u8; 4], f32)> {
+        let Some(info) = self.fonts.get(font_id.0) else { return Vec::new() };
+        let Ok(face5) = info.font_face.cast::<IDWriteFontFace5>() else { return Vec::new() };
+        unsafe {
+            if !face5.HasVariations().as_bool() {
+                return Vec::new();
+            }
+            let count = face5.GetFontAxisValueCount() as usize;
+            let mut values = vec![DWRITE_FONT_AXIS_VALUE::default(); count];
+            if face5.GetFontAxisValues(&mut values).is_err() {
+                return Vec::new();
+            }
+            values.iter().map(|v| (v.axisTag.0.to_le_bytes(), v.value)).collect()
+        }
     }
 
     fn get_advance(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Size<f32>> {
