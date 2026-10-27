@@ -1,3 +1,4 @@
+// Modified by ibis inc. for ibisOffice (2026-10-27): report DirectWrite font simulations for PDF/print.
 // Modified by ibis inc. for ibisOffice (2026-10-01): implemented `PlatformTextSystem::font_data`.
 // Modified by ibis inc. for ibisOffice (2026-10-12): `layout_line` keeps the lines it laid out, by text, size and font runs.
 use std::{
@@ -282,6 +283,14 @@ impl PlatformTextSystem for DirectWriteTextSystem {
 
     fn font_data(&self, font_id: FontId) -> Option<(Arc<Vec<u8>>, u32)> {
         self.state.write().font_data(font_id)
+    }
+
+    fn synthetic_style(&self, font_id: FontId) -> (bool, bool) {
+        let state = self.state.read();
+        let Some(font) = state.fonts.get(font_id.0) else { return (false, false) };
+        // Simulations belong to the selected face, including fallback faces.
+        let flags = unsafe { font.font_face.GetSimulations() };
+        (flags.contains(DWRITE_FONT_SIMULATIONS_BOLD), flags.contains(DWRITE_FONT_SIMULATIONS_OBLIQUE))
     }
 
     fn typographic_bounds(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Bounds<f32>> {
