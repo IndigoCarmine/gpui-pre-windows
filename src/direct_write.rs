@@ -1,6 +1,8 @@
 // Modified by ibis inc. for ibisOffice (2026-10-27): report DirectWrite font simulations for PDF/print.
 // Modified by ibis inc. for ibisOffice (2026-10-01): implemented `PlatformTextSystem::font_data`.
 // Modified by ibis inc. for ibisOffice (2026-10-12): `layout_line` keeps the lines it laid out, by text, size and font runs.
+// Modified by ibis inc. for ibisOffice (2026-10-28): `PlatformTextSystem::font_variations` (the axis values of a variable font's face).
+// Modified by ibis inc. for ibisOffice (2026-10-25): a face DirectWrite emboldens (a family without a bold face) keeps the regular face's advances; `PlatformTextSystem::synthetic_style`.
 use std::{
     borrow::Cow,
     ffi::{c_uint, c_void},
@@ -281,16 +283,16 @@ impl PlatformTextSystem for DirectWriteTextSystem {
         self.state.read().font_metrics(font_id)
     }
 
+    fn synthetic_style(&self, font_id: FontId) -> (bool, bool) {
+        self.state.read().synthetic_style(font_id)
+    }
+
     fn font_data(&self, font_id: FontId) -> Option<(Arc<Vec<u8>>, u32)> {
         self.state.write().font_data(font_id)
     }
 
-    fn synthetic_style(&self, font_id: FontId) -> (bool, bool) {
-        let state = self.state.read();
-        let Some(font) = state.fonts.get(font_id.0) else { return (false, false) };
-        // Simulations belong to the selected face, including fallback faces.
-        let flags = unsafe { font.font_face.GetSimulations() };
-        (flags.contains(DWRITE_FONT_SIMULATIONS_BOLD), flags.contains(DWRITE_FONT_SIMULATIONS_OBLIQUE))
+    fn font_variations(&self, font_id: FontId) -> Vec<([u8; 4], f32)> {
+        self.state.read().font_variations(font_id)
     }
 
     fn typographic_bounds(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Bounds<f32>> {
@@ -1366,6 +1368,32 @@ impl DirectWriteState {
         }
     }
 
+    /// Whether DirectWrite emboldens and slants the face (a family without a bold or italic face of its own): the glyphs
+    /// the font file holds are the regular ones, so a PDF has to thicken and slant them itself.
+    fn synthetic_style(&self, font_id: FontId) -> (bool, bool) {
+        self.fonts.get(font_id.0).map_or((false, false), |info| {
+            let simulations = unsafe { info.font_face.GetSimulations() }.0;
+            (simulations & DWRITE_FONT_SIMULATIONS_BOLD.0 != 0, simulations & DWRITE_FONT_SIMULATIONS_OBLIQUE.0 != 0)
+        })
+    }
+
+    /// The axis values (`wght`, `wdth`, ...) of the face when it is an instance of a variable font; empty otherwise.
+    fn font_variations(&self, font_id: FontId) -> Vec<([u8; 4], f32)> {
+        let Some(info) = self.fonts.get(font_id.0) else { return Vec::new() };
+        let Ok(face5) = info.font_face.cast::<IDWriteFontFace5>() else { return Vec::new() };
+        unsafe {
+            if !face5.HasVariations().as_bool() {
+                return Vec::new();
+            }
+            let count = face5.GetFontAxisValueCount() as usize;
+            let mut values = vec![DWRITE_FONT_AXIS_VALUE::default(); count];
+            if face5.GetFontAxisValues(&mut values).is_err() {
+                return Vec::new();
+            }
+            values.iter().map(|v| (v.axisTag.0.to_le_bytes(), v.value)).collect()
+        }
+    }
+
     fn get_advance(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Size<f32>> {
         unsafe {
             let font = &self.fonts[font_id.0].font_face;
@@ -1690,6 +1718,7 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
             )?
         };
 
+        let widening = simulated_bold_widening(font_face, glyph_ids, glyphrun.fontEmSize);
         let cluster_analyzer = ClusterAnalyzer::new(cluster_map, glyph_count);
         let mut utf16_idx = desc.textPosition as usize;
         let mut glyph_idx = 0;
@@ -1715,7 +1744,7 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
                     index: context.index_converter.utf8_ix,
                     is_emoji,
                 });
-                context.width += glyph_advances[this_glyph_idx];
+                context.width += glyph_advances[this_glyph_idx] - widening.as_ref().map_or(0.0, |w| w[this_glyph_idx]);
             }
             glyph_idx += cluster_glyph_count;
         }
@@ -1876,6 +1905,31 @@ fn get_font_names_from_collection(
         }
 
         result
+    }
+}
+
+/// How much wider DirectWrite's simulated bold makes each glyph of a run than the face it emboldens (design units
+/// scaled to the run's size). PowerPoint and ibisOffice's macOS text system draw such a bold by thickening the regular
+/// glyphs without moving the next one, so the advance is the regular face's.
+fn simulated_bold_widening(font_face: &IDWriteFontFace3, glyph_ids: &[u16], em_size: f32) -> Option<Vec<f32>> {
+    unsafe {
+        let simulations = font_face.GetSimulations();
+        if simulations.0 & DWRITE_FONT_SIMULATIONS_BOLD.0 == 0 {
+            return None;
+        }
+        let plain = font_face
+            .GetFontFaceReference()
+            .ok()?
+            .CreateFontFaceWithSimulations(DWRITE_FONT_SIMULATIONS(simulations.0 & !DWRITE_FONT_SIMULATIONS_BOLD.0))
+            .ok()?;
+        let mut metrics = std::mem::zeroed();
+        font_face.GetMetrics(&mut metrics);
+        let scale = em_size / metrics.Base.designUnitsPerEm as f32;
+        let mut emboldened = vec![DWRITE_GLYPH_METRICS::default(); glyph_ids.len()];
+        let mut regular = vec![DWRITE_GLYPH_METRICS::default(); glyph_ids.len()];
+        font_face.GetDesignGlyphMetrics(glyph_ids.as_ptr(), glyph_ids.len() as u32, emboldened.as_mut_ptr(), false).ok()?;
+        plain.GetDesignGlyphMetrics(glyph_ids.as_ptr(), glyph_ids.len() as u32, regular.as_mut_ptr(), false).ok()?;
+        Some(emboldened.iter().zip(&regular).map(|(e, r)| ((e.advanceWidth as f32 - r.advanceWidth as f32) * scale).max(0.0)).collect())
     }
 }
 
