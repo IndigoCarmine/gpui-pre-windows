@@ -2,6 +2,7 @@
 // Modified by ibis inc. for ibisOffice (2026-10-01): implemented `PlatformTextSystem::font_data`.
 // Modified by ibis inc. for ibisOffice (2026-10-12): `layout_line` keeps the lines it laid out, by text, size and font runs.
 // Modified by ibis inc. for ibisOffice (2026-10-28): `PlatformTextSystem::font_variations` (the axis values of a variable font's face).
+// Modified by ibis inc. for ibisOffice (2026-11-03): a color glyph with a COLR version 1 paint tree (gradients) is drawn by Direct2D; `glyph_for_char` is `None` for a character the font lacks.
 // Modified by ibis inc. for ibisOffice (2026-10-25): a face DirectWrite emboldens (a family without a bold face) keeps the regular face's advances; `PlatformTextSystem::synthetic_style`.
 use std::{
     borrow::Cow,
@@ -19,15 +20,28 @@ use windows::{
         Foundation::*,
         Globalization::GetUserDefaultLocaleName,
         Graphics::{
+            Direct2D::{
+                Common::{D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT},
+                D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_RENDER_TARGET_PROPERTIES,
+                D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE, D2D1CreateFactory, ID2D1DeviceContext7,
+                ID2D1Factory1,
+            },
             Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP, Direct3D11::*, DirectWrite::*,
             Dxgi::Common::*, Gdi::LOGFONTW,
+            Imaging::{
+                CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICImagingFactory,
+                WICBitmapCacheOnLoad,
+            },
         },
-        System::SystemServices::LOCALE_NAME_MAX_LENGTH,
+        System::{
+            Com::{CLSCTX_INPROC_SERVER, CoCreateInstance},
+            SystemServices::LOCALE_NAME_MAX_LENGTH,
+        },
         UI::WindowsAndMessaging::*,
     },
     core::*,
 };
-use windows_numerics::Vector2;
+use windows_numerics::{Matrix3x2, Vector2};
 
 use crate::*;
 use gpui::*;
@@ -894,6 +908,9 @@ impl DirectWriteState {
                 .GetGlyphIndices(&raw const codepoints, 1, &raw mut glyph_indices)
                 .log_err()
         }
+        // Modified by ibis inc.: glyph 0 is `.notdef`, what a font without the character
+        // maps it to; the character has no glyph (as the other platforms report it).
+        .filter(|_| glyph_indices != 0)
         .map(|_| GlyphId(glyph_indices as u32))
     }
 
@@ -1033,6 +1050,21 @@ impl DirectWriteState {
             bidiLevel: 0,
         };
 
+        // Modified by ibis inc.: a glyph with a COLR version 1 paint tree (Segoe UI Emoji's
+        // gradients on Windows 11) is drawn as the font draws it; its version 0 layers below
+        // are flat colors the font keeps for older renderers.
+        match Self::rasterize_paint_tree(
+            components,
+            &glyph_run,
+            Vector2::new(baseline_origin_x, baseline_origin_y),
+            params.scale_factor,
+            bitmap_size,
+        ) {
+            Ok(Some(bitmap)) => return Ok(bitmap),
+            Ok(None) => {}
+            Err(error) => log::debug!("COLR v1 glyph not drawn by Direct2D: {error:?}"),
+        }
+
         // todo: support formats other than COLR
         let color_enumerator = unsafe {
             components.factory.TranslateColorGlyphRun(
@@ -1164,6 +1196,112 @@ impl DirectWriteState {
             &render_target_texture,
             &render_target_view,
         )
+    }
+
+    /// Modified by ibis inc.: the glyph drawn from its COLR version 1 paint tree by Direct2D
+    /// (`ID2D1DeviceContext7::DrawPaintGlyphRun`, Windows 11) into a bitmap of `bitmap_size`,
+    /// straight-alpha BGRA as `rasterize_color` returns; `None` when the glyph has no paint
+    /// tree. `transform`'s scale maps the run's units to the bitmap's pixels.
+    fn rasterize_paint_tree(
+        components: &DirectWriteComponents,
+        glyph_run: &DWRITE_GLYPH_RUN,
+        baseline_origin: Vector2,
+        scale_factor: f32,
+        bitmap_size: Size<DevicePixels>,
+    ) -> Result<Option<Vec<u8>>> {
+        let factory: IDWriteFactory8 = components.factory.cast()?;
+        let Ok(enumerator) = (unsafe {
+            factory.TranslateColorGlyphRun(
+                baseline_origin,
+                glyph_run,
+                None,
+                DWRITE_GLYPH_IMAGE_FORMATS_COLR_PAINT_TREE | DWRITE_GLYPH_IMAGE_FORMATS_TRUETYPE,
+                DWRITE_PAINT_FEATURE_LEVEL_COLR_V1,
+                DWRITE_MEASURING_MODE_NATURAL,
+                None,
+                0,
+            )
+        }) else {
+            return Ok(None);
+        };
+        let mut runs = Vec::new();
+        loop {
+            let run = unsafe { &*enumerator.GetCurrentRun()? };
+            runs.push((
+                run.glyphImageFormat,
+                Vector2::new(run.Base.baselineOriginX, run.Base.baselineOriginY),
+                run.Base.glyphRun.clone(),
+            ));
+            if !unsafe { enumerator.MoveNext() }?.as_bool() {
+                break;
+            }
+        }
+        if !runs
+            .iter()
+            .any(|(format, ..)| *format == DWRITE_GLYPH_IMAGE_FORMATS_COLR_PAINT_TREE)
+        {
+            return Ok(None);
+        }
+
+        let (width, height) = (bitmap_size.width.0 as u32, bitmap_size.height.0 as u32);
+        let wic: IWICImagingFactory =
+            unsafe { CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER) }?;
+        let bitmap = unsafe {
+            wic.CreateBitmap(width, height, &GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnLoad)
+        }?;
+        let d2d: ID2D1Factory1 =
+            unsafe { D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None) }?;
+        let target = unsafe {
+            d2d.CreateWicBitmapRenderTarget(
+                &bitmap,
+                &D2D1_RENDER_TARGET_PROPERTIES {
+                    pixelFormat: D2D1_PIXEL_FORMAT {
+                        format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                        alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                    },
+                    dpiX: 96.0,
+                    dpiY: 96.0,
+                    ..Default::default()
+                },
+            )
+        }?;
+        let context: ID2D1DeviceContext7 = target.cast()?;
+        let black = D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
+        let brush = unsafe { context.CreateSolidColorBrush(&black, None) }?;
+        unsafe {
+            context.BeginDraw();
+            context.Clear(Some(&D2D1_COLOR_F::default()));
+            context.SetTransform(&Matrix3x2 {
+                M11: scale_factor,
+                M12: 0.0,
+                M21: 0.0,
+                M22: scale_factor,
+                M31: 0.0,
+                M32: 0.0,
+            });
+            context.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+            for (format, origin, run) in &runs {
+                if *format == DWRITE_GLYPH_IMAGE_FORMATS_COLR_PAINT_TREE {
+                    context.DrawPaintGlyphRun(*origin, run, &brush, 0, DWRITE_MEASURING_MODE_NATURAL);
+                } else {
+                    context.DrawGlyphRun(*origin, run, None, &brush, DWRITE_MEASURING_MODE_NATURAL);
+                }
+            }
+            context.EndDraw(None, None)?;
+        }
+
+        let mut pixels = vec![0u8; (width * height * 4) as usize];
+        unsafe { bitmap.CopyPixels(std::ptr::null(), width * 4, &mut pixels) }?;
+        // Premultiplied to straight alpha, as the layers' composite is returned.
+        for chunk in pixels.chunks_exact_mut(4) {
+            let a = chunk[3] as f32;
+            if a > 0.0 {
+                for c in &mut chunk[..3] {
+                    *c = (*c as f32 * 255.0 / a).clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+        Ok(Some(pixels))
     }
 
     fn composite_color_layers(
@@ -2119,6 +2257,7 @@ mod tests {
     use super::{DirectWriteState, DirectWriteTextSystem, GPUState, GlyphLayerTexture};
     use crate::direct_write::ClusterAnalyzer;
     use crate::directx_devices::DirectXDevices;
+    use windows::Win32::Graphics::DirectWrite::{DWRITE_GLYPH_OFFSET, DWRITE_GLYPH_RUN};
     use anyhow::Result;
     use gpui::{
         DevicePixels, Font, PlatformTextSystem, RenderGlyphParams, Rgba, bounds, point, px, size,
@@ -2166,6 +2305,54 @@ mod tests {
         assert_eq!(next, Some((5, 1)));
         let next = analyzer.next();
         assert_eq!(next, None);
+    }
+
+    /// Modified by ibis inc.: Segoe UI Emoji's glyphs have COLR version 1 paint trees on
+    /// Windows 11; Direct2D draws them in colour, and a glyph with none is left to the
+    /// version 0 layers.
+    #[test]
+    fn color_emoji_paint_tree_is_drawn_in_colour() -> Result<()> {
+        unsafe { windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED).ok().ok() };
+        let devices = DirectXDevices::new()?;
+        let text_system = DirectWriteTextSystem::new(&devices)?;
+        let font_id = text_system.font_id(&Font { family: "Segoe UI Emoji".into(), ..Default::default() })?;
+        let glyph_id = text_system.glyph_for_char(font_id, '🎈').expect("a balloon");
+        let params = RenderGlyphParams {
+            font_id,
+            glyph_id,
+            font_size: px(48.0),
+            subpixel_variant: point(0u8, 0u8),
+            scale_factor: 1.5,
+            is_emoji: true,
+            subpixel_rendering: false,
+            dilation: 0,
+        };
+        let bounds = text_system.glyph_raster_bounds(&params)?;
+        let state = text_system.state.read();
+        let font = &state.fonts[font_id.0];
+        let glyph = [glyph_id.0 as u16];
+        let advance = [bounds.size.width.0 as f32];
+        let offset = [DWRITE_GLYPH_OFFSET {
+            advanceOffset: -bounds.origin.x.0 as f32 / 1.5,
+            ascenderOffset: bounds.origin.y.0 as f32 / 1.5,
+        }];
+        let run = DWRITE_GLYPH_RUN {
+            fontFace: std::mem::ManuallyDrop::new(Some(unsafe { std::ptr::read(&***font.font_face) })),
+            fontEmSize: 48.0,
+            glyphCount: 1,
+            glyphIndices: glyph.as_ptr(),
+            glyphAdvances: advance.as_ptr(),
+            glyphOffsets: offset.as_ptr(),
+            isSideways: false.into(),
+            bidiLevel: 0,
+        };
+        let pixels = DirectWriteState::rasterize_paint_tree(&text_system.components, &run, windows_numerics::Vector2::default(), 1.5, bounds.size)?
+            .expect("Segoe UI Emoji has a paint tree for the balloon");
+        let opaque = pixels.chunks(4).filter(|p| p[3] == 255).count();
+        let coloured = pixels.chunks(4).filter(|p| p[3] > 0 && (p[0] != p[1] || p[1] != p[2])).count();
+        assert!(opaque > pixels.len() / 4 / 4, "the glyph is drawn: {opaque} opaque texels");
+        assert!(coloured > opaque / 2, "the glyph is in colour: {coloured} of {opaque}");
+        Ok(())
     }
 
     #[test]
