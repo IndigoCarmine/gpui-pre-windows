@@ -647,52 +647,80 @@ impl WindowsWindowInner {
         if handled { Some(0) } else { Some(1) }
     }
 
-    fn retrieve_caret_position(&self) -> Option<POINT> {
+    fn retrieve_caret_bounds(&self) -> Option<RECT> {
         self.with_input_handler_and_scale_factor(|input_handler, scale_factor| {
             let caret_range = input_handler.selected_text_range(false)?;
-            let caret_position = input_handler.bounds_for_range(caret_range.range)?;
-            Some(POINT {
-                // logical to physical
-                x: (caret_position.origin.x.as_f32() * scale_factor) as i32,
-                y: (caret_position.origin.y.as_f32() * scale_factor) as i32
-                    + ((caret_position.size.height.as_f32() * scale_factor) as i32 / 2),
-            })
+            let caret_bounds = input_handler.bounds_for_range(caret_range.range)?;
+            Some(physical_rect(caret_bounds, scale_factor))
         })
     }
 
     fn handle_ime_position(&self, handle: HWND) -> Option<isize> {
-        if let Some(caret_position) = self.retrieve_caret_position() {
-            self.update_ime_position(handle, caret_position);
+        if let Some(caret_bounds) = self.retrieve_caret_bounds() {
+            self.update_ime_position(handle, caret_bounds);
         }
         Some(0)
     }
 
-    pub(crate) fn update_ime_position(&self, handle: HWND, caret_position: POINT) {
+    /// Places the composition and candidate windows at the caret, given in
+    /// physical pixels. Modified by ibis inc.: the caret is a rectangle, and
+    /// in vertical text the IME is given a vertical font and kept off the
+    /// column being composed.
+    pub(crate) fn update_ime_position(&self, handle: HWND, caret: RECT) {
         let Some(ctx) = ImeContext::get(handle) else {
             return;
         };
-        unsafe {
-            ImmSetCompositionWindow(
-                *ctx,
-                &COMPOSITIONFORM {
+        let vertical = self.state.ime_vertical.get();
+        if vertical {
+            set_ime_font(*ctx, true);
+        }
+        // Vertical text hangs from the top right corner of its column (the
+        // font is turned 270 degrees); the candidates are set beside the
+        // column, not over it, as Microsoft Word sets them.
+        let (composition, candidate) = if vertical {
+            (
+                COMPOSITIONFORM {
                     dwStyle: CFS_POINT,
-                    ptCurrentPos: caret_position,
+                    ptCurrentPos: POINT { x: caret.right, y: caret.top },
+                    ..Default::default()
+                },
+                CANDIDATEFORM {
+                    dwStyle: CFS_EXCLUDE,
+                    ptCurrentPos: POINT { x: caret.left, y: caret.top },
+                    rcArea: caret,
                     ..Default::default()
                 },
             )
-            .ok()
-            .log_err();
-
-            ImmSetCandidateWindow(
-                *ctx,
-                &CANDIDATEFORM {
+        } else {
+            let point = POINT { x: caret.left, y: (caret.top + caret.bottom) / 2 };
+            (
+                COMPOSITIONFORM {
+                    dwStyle: CFS_POINT,
+                    ptCurrentPos: point,
+                    ..Default::default()
+                },
+                CANDIDATEFORM {
                     dwStyle: CFS_CANDIDATEPOS,
-                    ptCurrentPos: caret_position,
+                    ptCurrentPos: point,
                     ..Default::default()
                 },
             )
-            .ok()
-            .log_err();
+        };
+        unsafe {
+            ImmSetCompositionWindow(*ctx, &composition).ok().log_err();
+            ImmSetCandidateWindow(*ctx, &candidate).ok().log_err();
+        }
+    }
+
+    /// Modified by ibis inc.: whether the focused text runs top to bottom.
+    /// The IME lays its composition and candidates out vertically when its
+    /// composition font is a vertical one.
+    pub(crate) fn set_ime_vertical(&self, handle: HWND, vertical: bool) {
+        if self.state.ime_vertical.replace(vertical) == vertical {
+            return;
+        }
+        if let Some(ctx) = ImeContext::get(handle) {
+            set_ime_font(*ctx, vertical);
         }
     }
 
@@ -1457,6 +1485,35 @@ impl WindowsWindowInner {
         self.state.input_handler.set(Some(input_handler));
         result
     }
+}
+
+/// Logical bounds to a rectangle in physical pixels.
+pub(crate) fn physical_rect(bounds: Bounds<Pixels>, scale_factor: f32) -> RECT {
+    let left = (bounds.origin.x.as_f32() * scale_factor) as i32;
+    let top = (bounds.origin.y.as_f32() * scale_factor) as i32;
+    RECT {
+        left,
+        top,
+        right: left + (bounds.size.width.as_f32() * scale_factor) as i32,
+        bottom: top + (bounds.size.height.as_f32() * scale_factor) as i32,
+    }
+}
+
+/// Modified by ibis inc.: the IME's composition font. A vertical font is the
+/// `@` face turned 270 degrees, as GDI draws vertical text; the IME reads
+/// the escapement to lay its windows out top to bottom.
+fn set_ime_font(ctx: HIMC, vertical: bool) {
+    let face = if vertical { "@Yu Gothic UI" } else { "Yu Gothic UI" };
+    let mut font = LOGFONTW {
+        lfEscapement: if vertical { 2700 } else { 0 },
+        lfOrientation: if vertical { 2700 } else { 0 },
+        lfCharSet: SHIFTJIS_CHARSET,
+        ..Default::default()
+    };
+    for (slot, unit) in font.lfFaceName.iter_mut().zip(face.encode_utf16()) {
+        *slot = unit;
+    }
+    unsafe { ImmSetCompositionFontW(ctx, &font).ok().log_err() };
 }
 
 struct ImeContext {
